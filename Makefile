@@ -21,12 +21,11 @@
 #   - fabric-ca-client - builds the fabric-ca-client executable
 #   - unit-tests - Performs checks first and runs the go-test based unit tests
 #   - checks - runs all check conditions (license, format, imports, lint and vet)
-#   - ldap-tests - runs the LDAP tests
 #   - docker[-clean] - ensures all docker images are available[/cleaned]
 #   - clean - cleans the build area
 
 PROJECT_NAME   = fabric-ca
-BASE_VERSION   = 1.0.0
+BASE_VERSION   = 1.0.0-alpha3
 IS_RELEASE     = false
 
 ifneq ($(IS_RELEASE),true)
@@ -36,11 +35,6 @@ else
 PROJECT_VERSION=$(BASE_VERSION)
 endif
 
-# Check that all dependencies are installed
-EXECUTABLES = go docker git curl
-K := $(foreach exec,$(EXECUTABLES),\
-	$(if $(shell which $(exec)),some string,$(error "No $(exec) in PATH: Check dependencies")))
-
 ARCH=$(shell uname -m)
 ifeq ($(ARCH),s390x)
 PGVER=9.4
@@ -48,11 +42,12 @@ else
 PGVER=9.5
 endif
 
-BASEIMAGE_RELEASE = 0.3.0
+BASEIMAGE_RELEASE = 0.3.1
 PKGNAME = github.com/hyperledger/$(PROJECT_NAME)
 
 DOCKER_ORG = hyperledger
-IMAGES = $(PROJECT_NAME) openldap
+IMAGES = $(PROJECT_NAME)
+FVTIMAGE = $(PROJECT_NAME)-fvt
 
 path-map.fabric-ca-client := ./cmd/fabric-ca-client
 path-map.fabric-ca-server := ./cmd/fabric-ca-server
@@ -65,6 +60,8 @@ rename: .FORCE
 	@scripts/rename-repo
 
 docker: $(patsubst %,build/image/%/$(DUMMY), $(IMAGES))
+
+docker-fvt: $(patsubst %,build/image/%/$(DUMMY), $(FVTIMAGE))
 
 checks: license vet lint format imports
 
@@ -85,8 +82,6 @@ vet: .FORCE
 
 fabric-ca-client: bin/fabric-ca-client
 fabric-ca-server: bin/fabric-ca-server
-
-openldap: build/image/openldap/$(DUMMY)
 
 bin/%:
 	@echo "Building ${@F} in bin directory ..."
@@ -128,14 +123,19 @@ build/image/fabric-ca/payload: \
 	build/docker/bin/fabric-ca-client \
 	build/docker/bin/fabric-ca-server \
 	build/fabric-ca.tar.bz2
-build/image/openldap/payload : \
-	images/openldap/openldap.tar
+build/image/fabric-ca-fvt/payload: \
+	build/docker/bin/fabric-ca-client \
+	build/docker/bin/fabric-ca-server \
+	images/fabric-ca-fvt/base.ldif \
+	images/fabric-ca-fvt/add-users.ldif \
+	images/fabric-ca-fvt/start.sh
 build/image/%/payload:
 	@echo "Copying $^ to $@"
 	mkdir -p $@
 	cp $^ $@
 
 build/fabric-ca.tar.bz2: $(shell git ls-files images/fabric-ca/payload)
+
 build/%.tar.bz2:
 	@echo "Building $@"
 	@tar -jc -C images/$*/payload $(notdir $^) > $@
@@ -143,17 +143,21 @@ build/%.tar.bz2:
 unit-tests: checks fabric-ca-server fabric-ca-client
 	@scripts/run_tests
 
-container-tests: docker ldap-tests
+container-tests: docker
 
-ldap-tests: openldap
-	@scripts/run_ldap_tests
+fvt-tests:
+	@scripts/run_fvt_tests
+
+ci-tests: docker-clean docker-fvt unit-tests
+	@docker run -v $(shell pwd):/opt/gopath/src/github.com/hyperledger/fabric-ca hyperledger/fabric-ca-fvt
 
 %-docker-clean:
 	$(eval TARGET = ${patsubst %-docker-clean,%,${@}})
 	-docker images -q $(DOCKER_ORG)/$(TARGET):latest | xargs -I '{}' docker rmi -f '{}'
 	-@rm -rf build/image/$(TARGET) ||:
 
-docker-clean: $(patsubst %,%-docker-clean, $(IMAGES))
+docker-clean: $(patsubst %,%-docker-clean, $(IMAGES) $(PROJECT_NAME)-fvt)
+	@rm -rf build/docker/bin/* ||:
 
 .PHONY: clean
 

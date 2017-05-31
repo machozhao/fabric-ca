@@ -23,7 +23,9 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,14 +34,16 @@ import (
 	"github.com/hyperledger/fabric-ca/lib/tls"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/stretchr/testify/assert"
 )
 
 const (
-	rootPort         = 7055
+	rootPort         = 7075
 	rootDir          = "rootDir"
-	intermediatePort = 7056
+	intermediatePort = 7076
 	intermediateDir  = "intDir"
 	testdataDir      = "../testdata"
+	pportEnvVar      = "FABRIC_CA_SERVER_PROFILE_PORT"
 )
 
 func TestServerInit(t *testing.T) {
@@ -59,6 +63,10 @@ func TestServerInit(t *testing.T) {
 	if err != nil {
 		t.Errorf("Third Server init renew failed: %s", err)
 	}
+	// Verify that the duration of the newly created certificate is 15 years
+	d, err := util.GetCertificateDurationFromFile(path.Join(rootDir, "ca-cert.pem"))
+	assert.NoError(t, err)
+	assert.True(t, d.Hours() == 131400, fmt.Sprintf("Expecting 131400 but found %f", d.Hours()))
 }
 
 func TestRootServer(t *testing.T) {
@@ -87,6 +95,8 @@ func TestRootServer(t *testing.T) {
 		t.Fatalf("Failed to enroll admin/adminpw: %s", err)
 	}
 	admin = eresp.Identity
+	// test registration permissions wrt roles and affiliation
+	testRegistration(admin, t)
 	// Register user1
 	rr, err = admin.Register(&api.RegistrationRequest{
 		Name:        "user1",
@@ -106,7 +116,7 @@ func TestRootServer(t *testing.T) {
 	}
 	user1 = eresp.Identity
 	// The admin ID should have 1 cert in the DB now
-	recs, err = server.CertDBAccessor().GetCertificatesByID("admin")
+	recs, err = server.CA.CertDBAccessor().GetCertificatesByID("admin")
 	if err != nil {
 		t.Errorf("Could not get admin's certs from DB: %s", err)
 	}
@@ -156,6 +166,81 @@ func TestRootServer(t *testing.T) {
 	}
 }
 
+// TestProfiling tests if profiling endpoint can be accessed when profiling is
+// enabled and not accessible when disabled (default)
+func TestProfiling(t *testing.T) {
+	t.Log("start TestProfiling")
+	pport := rootPort + 1000
+	url := fmt.Sprintf("http://localhost:%d/debug/pprof/heap", pport)
+
+	// Start the server with profiling disabled
+	os.Setenv(pportEnvVar, strconv.Itoa(-1))
+	server := getServer(rootPort, rootDir, "", 0, t)
+	if server == nil {
+		return
+	}
+	err := server.Start()
+	if err != nil {
+		t.Fatalf("Server start failed: %s", err)
+	}
+	resp1, err2 := sendGetReq(url, t)
+	// send heap profiling request to the server and expect a bad response
+	// as profiling is disabled
+	if err2 == nil && resp1.StatusCode == 200 {
+		responseData, _ := ioutil.ReadAll(resp1.Body)
+		t.Errorf("Expected error response for profile request %s but got good response: %s",
+			url, responseData)
+	}
+	server.Stop()
+
+	// Start the server with profiling enabled but port set to server port
+	os.Setenv(pportEnvVar, strconv.Itoa(rootPort))
+	server = getServer(rootPort, rootDir, "", 0, t)
+	if server == nil {
+		return
+	}
+	err = server.Start()
+	if err == nil {
+		t.Fatalf("Server should not have started because of port conflict")
+	}
+
+	// Start the server with profiling enabled
+	os.Setenv(pportEnvVar, strconv.Itoa(pport))
+	defer os.Unsetenv(pportEnvVar)
+	server = getServer(rootPort, rootDir, "", 0, t)
+	if server == nil {
+		return
+	}
+	err = server.Start()
+	if err != nil {
+		t.Fatalf("Server start failed: %s", err)
+	}
+	defer server.Stop()
+
+	// send heap profiling request to the server and expect a 200 response
+	// as profiling is enabled
+	resp, err1 := sendGetReq(url, t)
+	if err1 != nil || resp.StatusCode != 200 {
+		if err1 == nil {
+			responseData, _ := ioutil.ReadAll(resp.Body)
+			err1 = fmt.Errorf("Invalid response %s with code %d returned for the request %s",
+				string(responseData), resp.StatusCode, url)
+		}
+		t.Errorf("Failed to send request to %s: %s", url, err1)
+	}
+}
+
+// sendGetReq sends GET request to the specified URL
+func sendGetReq(url string, t *testing.T) (resp *http.Response, err error) {
+	req, err := http.NewRequest("GET", url, bytes.NewReader([]byte{}))
+	if err != nil {
+		t.Fatalf("Failed to create request for url %s: %s", url, err)
+	}
+	var tr = new(http.Transport)
+	httpClient := &http.Client{Transport: tr}
+	return httpClient.Do(req)
+}
+
 func TestIntermediateServer(t *testing.T) {
 	var err error
 
@@ -168,18 +253,85 @@ func TestIntermediateServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Root server start failed: %s", err)
 	}
-	defer rootServer.Stop()
+	defer func() {
+		err = rootServer.Stop()
+		if err != nil {
+			t.Errorf("Root server stop failed: %s", err)
+		}
+	}()
 
 	for idx := 0; idx < 3; idx++ {
 		testIntermediateServer(idx, t)
 	}
+}
 
-	// Stop both servers
-	err = rootServer.Stop()
+func TestIntermediateServerWithTLS(t *testing.T) {
+	var err error
+
+	rootServer := getRootServer(t)
+	if rootServer == nil {
+		return
+	}
+	rootServer.Config.TLS.Enabled = true
+	rootServer.Config.TLS.CertFile = "../../testdata/tls_server-cert.pem"
+	rootServer.Config.TLS.KeyFile = "../../testdata/tls_server-key.pem"
+	rootServer.Config.TLS.ClientAuth.Type = "RequireAndVerifyClientCert"
+	rootServer.Config.TLS.ClientAuth.CertFiles = []string{"../../testdata/root.pem"}
+	err = rootServer.Start()
 	if err != nil {
-		t.Errorf("Root server stop failed: %s", err)
+		t.Fatalf("Root server start failed: %s", err)
+	}
+	defer func() {
+		err = rootServer.Stop()
+		if err != nil {
+			t.Errorf("Root server stop failed: %s", err)
+		}
+	}()
+
+	parentURL := fmt.Sprintf("https://admin:adminpw@localhost:%d", rootPort)
+	intermediateServer := getServer(intermediatePort, intermediateDir, parentURL, 0, t)
+	if intermediateServer == nil {
+		return
+	}
+	intermediateServer.CA.Config.Intermediate.TLS.Client.CertFile = "../../testdata/tls_client-cert.pem"
+	intermediateServer.CA.Config.Intermediate.TLS.Client.KeyFile = "../../testdata/tls_client-key.pem"
+	intermediateServer.CA.Config.CSR.CN = "intermediateServer"
+
+	// Error case 1: CN specified for intermediate server
+	err = intermediateServer.Start()
+	if err == nil {
+		t.Errorf("CN specified for intermediate server, the server should have failed to start")
+	}
+
+	intermediateServer.CA.Config.CSR.CN = ""
+	intermediateServer.CA.Config.CSR.Hosts = []string{"testhost"}
+
+	// Error case 2: tls.certfiles not specified for intermediate server while connecting to parent CA server over TLS
+	err = intermediateServer.Start()
+	if err == nil {
+		t.Errorf("Certfiles not specified for the Intermediate server, the server should have failed to start")
+	}
+
+	// Success case
+	intermediateServer.CA.Config.Intermediate.TLS.CertFiles = []string{"../../testdata/root.pem"}
+	err = intermediateServer.Start()
+	if err != nil {
+		t.Errorf("Intermediate server start failed: %s", err)
+	}
+	time.Sleep(time.Second)
+
+	err = intermediateServer.Stop()
+	if err != nil {
+		t.Errorf("Intermediate server stop failed: %s", err)
+	}
+
+	// Make sure that the hostname was not inserted into the CA certificate
+	err = util.CheckHostsInCert(filepath.Join(intermediateDir, "ca-cert.pem"), "testhost")
+	if err == nil {
+		t.Error("A CA certificate should not have any hostnames")
 	}
 }
+
 func TestRunningTLSServer(t *testing.T) {
 	srv := getServer(rootPort, testdataDir, "", 0, t)
 
@@ -195,7 +347,7 @@ func TestRunningTLSServer(t *testing.T) {
 	clientConfig := &ClientConfig{
 		URL: fmt.Sprintf("https://localhost:%d", rootPort),
 		TLS: tls.ClientTLSConfig{
-			CertFilesList: []string{"../testdata/root.pem"},
+			CertFiles: []string{"../testdata/root.pem"},
 			Client: tls.KeyCertFiles{
 				KeyFile:  "../testdata/tls_client-key.pem",
 				CertFile: "../testdata/tls_client-cert.pem",
@@ -209,8 +361,6 @@ func TestRunningTLSServer(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to enroll over TLS: %s", err)
 	}
-
-	time.Sleep(1 * time.Second)
 
 	err = srv.Stop()
 	if err != nil {
@@ -227,8 +377,6 @@ func TestDefaultDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Root server start failed: %s", err)
 	}
-
-	time.Sleep(1 * time.Second)
 
 	err = srv.Stop()
 	if err != nil {
@@ -252,8 +400,6 @@ func TestBadAuthHeader(t *testing.T) {
 		t.Fatalf("Server start failed: %s", err)
 	}
 
-	time.Sleep(time.Second)
-
 	invalidTokenAuthorization(t)
 	invalidBasicAuthorization(t)
 
@@ -268,8 +414,8 @@ func invalidTokenAuthorization(t *testing.T) {
 	client := getRootClient()
 
 	emptyByte := make([]byte, 0)
-
-	req, err := http.NewRequest("POST", "http://localhost:7055/enroll", bytes.NewReader(emptyByte))
+	url := fmt.Sprintf("http://localhost:%d/enroll", rootPort)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(emptyByte))
 	if err != nil {
 		t.Error(err)
 	}
@@ -281,9 +427,9 @@ func invalidTokenAuthorization(t *testing.T) {
 		t.Error(err)
 	}
 
-	key, err := ioutil.ReadFile("../testdata/ec-key.pem")
+	key, err := util.ImportBCCSPKeyFromPEM("../testdata/ec-key.pem", CSP, true)
 	if err != nil {
-		t.Error(err)
+		t.Errorf("Failed importing key %s", err)
 	}
 
 	token, err := util.CreateToken(CSP, cert, key, emptyByte)
@@ -294,7 +440,6 @@ func invalidTokenAuthorization(t *testing.T) {
 	req.Header.Set("authorization", token)
 
 	err = client.SendReq(req, nil)
-
 	if err.Error() != "Error response from server was: Authorization failure" {
 		t.Error("Incorrect auth type set, request should have failed with authorization error")
 	}
@@ -304,8 +449,8 @@ func invalidBasicAuthorization(t *testing.T) {
 	client := getRootClient()
 
 	emptyByte := make([]byte, 0)
-
-	req, err := http.NewRequest("POST", "http://localhost:7055/register", bytes.NewReader(emptyByte))
+	url := fmt.Sprintf("http://localhost:%d/register", rootPort)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(emptyByte))
 	if err != nil {
 		t.Error(err)
 	}
@@ -325,22 +470,233 @@ func TestTLSAuthClient(t *testing.T) {
 	testClientAuth(t)
 }
 
+func TestMultiCAConfigs(t *testing.T) {
+	t.Log("TestMultiCA...")
+	srv := getServer(rootPort, testdataDir, "", 0, t)
+	srv.Config.CAfiles = []string{"ca/ca1/fabric-ca-server-config.yaml", "ca/ca1/fabric-ca-server-config.yaml", "ca/ca2/fabric-ca-server-config.yaml"}
+	srv.CA.Config.CSR.Hosts = []string{"hostname"}
+	t.Logf("Server configuration: %+v\n", srv.Config)
+
+	// Starting server with two cas with same name
+	err := srv.Start()
+	if err == nil {
+		t.Error("Trying to create two CAs by the same name, server start should have failed")
+	}
+
+	// Starting server with a missing ca config file
+	srv.Config.CAfiles = []string{"ca/rootca/ca1/fabric-ca-server-config.yaml", "ca/rootca/ca2/fabric-ca-server-config.yaml", "ca/rootca/ca4/fabric-ca-server-config.yaml"}
+	err = srv.Start()
+	if err == nil {
+		t.Error("Should have failed to start server, missing ca config file")
+	}
+
+	srv.Config.CAfiles = []string{"ca/rootca/ca1/fabric-ca-server-config.yaml", "ca/rootca/ca2/fabric-ca-server-config.yaml", "ca/rootca/ca3/fabric-ca-server-config.yaml"}
+	err = srv.Start()
+	t.Logf("Starting 3 CAs with a duplicated CN name: %s", err)
+	if err == nil {
+		t.Error("Should have failed to start server, CN name is the same across rootca2 and rootca3")
+	}
+
+	srv.Config.CAfiles = []string{"ca/rootca/ca1/fabric-ca-server-config.yaml", "ca/rootca/ca2/fabric-ca-server-config.yaml"}
+	t.Logf("Server configuration: %+v\n\n", srv.Config)
+
+	err = srv.Start()
+	if err != nil {
+		t.Fatal("Failed to start server:", err)
+	}
+
+	if !util.FileExists("../testdata/ca/rootca/ca1/fabric-ca-server.db") {
+		t.Error("Failed to correctly add ca1")
+	}
+
+	if !util.FileExists("../testdata/ca/rootca/ca2/fabric-ca2-server.db") {
+		t.Error("Failed to correctly add ca2")
+	}
+
+	// Non-existent CA specified by client
+	clientCA := getRootClient()
+	_, err = clientCA.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+		CAName: "rootca3",
+	})
+	if err == nil {
+		t.Error("Should have failed, client using ca name of 'ca3' but no CA exist by that name on server")
+	}
+
+	//Send enroll request to specific CA
+	clientCA1 := getRootClient()
+	_, err = clientCA1.Enroll(&api.EnrollmentRequest{
+		Name:   "adminca1",
+		Secret: "adminca1pw",
+		CAName: "rootca1",
+	})
+	if err != nil {
+		t.Error("Failed to enroll, error: ", err)
+	}
+
+	clientCA2 := getRootClient()
+	resp, err := clientCA2.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+		CAName: "rootca2",
+	})
+	if err != nil {
+		t.Error("Failed to enroll, error: ", err)
+	}
+
+	_, err = resp.Identity.Reenroll(&api.ReenrollmentRequest{
+		CAName: "rootca2",
+	})
+	if err != nil {
+		t.Error("Failed to reenroll, error: ", err)
+	}
+
+	// User enrolled with rootca2, should not be able to reenroll with rootca1
+	_, err = resp.Identity.Reenroll(&api.ReenrollmentRequest{
+		CAName: "rootca1",
+	})
+	if err == nil {
+		t.Error("Should have failed to reenroll a user with a different CA")
+	}
+
+	// No ca name specified should sent to default CA 'ca'
+	clientCA3 := getRootClient()
+	_, err = clientCA3.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+	})
+	if err != nil {
+		t.Error("Failed to enroll, error: ", err)
+	}
+
+	err = srv.Stop()
+	if err != nil {
+		t.Error("Failed to stop server:", err)
+	}
+	cleanMultiCADir()
+
+}
+
+func TestDefaultCAWithSetCAName(t *testing.T) {
+	srv := getServer(rootPort, testdataDir, "", 0, t)
+	srv.CA.Config.CA.Name = "DefaultCA"
+	t.Logf("Server configuration: %+v\n", srv.Config)
+
+	// Starting server with two cas with same name
+	err := srv.Start()
+	if err != nil {
+		t.Fatal("Failed to start server:", err)
+	}
+
+	// No ca name specified should sent to default CA 'ca'
+	client := getRootClient()
+	_, err = client.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+	})
+	if err != nil {
+		t.Error("Failed to enroll, error: ", err)
+	}
+
+	err = srv.Stop()
+	if err != nil {
+		t.Error("Failed to stop server:", err)
+	}
+}
+
+func TestMultiCAWithIntermediate(t *testing.T) {
+	srv := getServer(rootPort, testdataDir, "", 0, t)
+	srv.Config.CAfiles = []string{"ca/rootca/ca1/fabric-ca-server-config.yaml", "ca/rootca/ca2/fabric-ca-server-config.yaml"}
+	srv.CA.Config.CSR.Hosts = []string{"hostname"}
+	t.Logf("Server configuration: %+v\n", srv.Config)
+
+	// Starting server with two cas with same name
+	err := srv.Start()
+	if err != nil {
+		t.Fatal("Failed to start server: ", err)
+	}
+
+	intermediatesrv := getServer(intermediatePort, testdataDir, "", 0, t)
+	intermediatesrv.Config.CAfiles = []string{"ca/intermediateca/ca1/fabric-ca-server-config.yaml", "ca/intermediateca/ca2/fabric-ca-server-config.yaml"}
+	intermediatesrv.CA.Config.CSR.Hosts = []string{"hostname"}
+
+	// Start it
+	err = intermediatesrv.Start()
+	if err != nil {
+		t.Errorf("Failed to start intermediate server: %s", err)
+	}
+	// Stop it
+	err = intermediatesrv.Stop()
+	if err != nil {
+		t.Error("Failed to stop intermediate server: ", err)
+	}
+
+	if !util.FileExists("../testdata/ca/intermediateca/ca1/ca-chain.pem") {
+		t.Error("Failed to enroll intermediate ca")
+	}
+
+	err = srv.Stop()
+	if err != nil {
+		t.Error("Failed to stop server: ", err)
+	}
+
+	// Make sure there is no host name in the intermediate CA cert
+	err = util.CheckHostsInCert(filepath.Join("../testdata/ca/intermediateca/ca1", "ca-cert.pem"), "testhost1")
+	if err == nil {
+		t.Error("Intermediate CA should not contain a hostname, but does")
+	}
+}
+
+func TestDefaultMultiCA(t *testing.T) {
+	t.Log("TestDefaultMultiCA...")
+	srv := getServer(rootPort, "multica", "", -1, t)
+	srv.Config.CAcount = 4 // Starting 4 default CA instances
+	srv.Config.CAfiles = []string{"fabric-ca1-config.yaml"}
+
+	err := srv.Start()
+	if err == nil {
+		t.Error("Both cacount and cafiles set, should have failed to start server")
+	}
+
+	srv.Config.CAfiles = []string{}
+
+	err = srv.Start()
+	if err != nil {
+		t.Error("Failed to start server: ", err)
+	}
+
+	//Send enroll request to specific CA
+	clientCA1 := getRootClient()
+	_, err = clientCA1.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+		CAName: "ca4",
+	})
+	if err != nil {
+		t.Error("Failed to enroll, error: ", err)
+	}
+
+	err = srv.Stop()
+	if err != nil {
+		t.Error("Failed to stop server: ", err)
+	}
+}
+
 // Configure server to start server with no client authentication required
 func testNoClientCert(t *testing.T) {
 	srv := getServer(rootPort, testdataDir, "", 0, t)
-	srv = getTLSConfig(srv, "NoClientCert", "")
+	srv = getTLSConfig(srv, "NoClientCert", []string{})
 
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Root server start failed: %s", err)
 	}
 
-	time.Sleep(time.Second)
-
 	clientConfig := &ClientConfig{
 		URL: fmt.Sprintf("https://localhost:%d", rootPort),
 		TLS: tls.ClientTLSConfig{
-			CertFilesList: []string{"../testdata/root.pem"},
+			CertFiles: []string{"../testdata/root.pem"},
 		},
 	}
 
@@ -361,14 +717,12 @@ func testNoClientCert(t *testing.T) {
 // Root2.pem does not exists, server should still start because no client auth is requred
 func testInvalidRootCertWithNoClientAuth(t *testing.T) {
 	srv := getServer(rootPort, testdataDir, "", 0, t)
-	srv = getTLSConfig(srv, "NoClientCert", "../testdata/root.pem, ../testdata/root2.pem")
+	srv = getTLSConfig(srv, "NoClientCert", []string{"../testdata/root.pem", "../testdata/root2.pem"})
 
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Root server start failed: %s", err)
 	}
-
-	time.Sleep(time.Second)
 
 	err = srv.Stop()
 	if err != nil {
@@ -380,7 +734,7 @@ func testInvalidRootCertWithNoClientAuth(t *testing.T) {
 // Root2.pem does not exists, server should fail to start
 func testInvalidRootCertWithClientAuth(t *testing.T) {
 	srv := getServer(rootPort, testdataDir, "", 0, t)
-	srv = getTLSConfig(srv, "RequireAndVerifyClientCert", "../testdata/root.pem, ../testdata/root2.pem")
+	srv = getTLSConfig(srv, "RequireAndVerifyClientCert", []string{"../testdata/root.pem", "../testdata/root2.pem"})
 
 	err := srv.Start()
 	if err == nil {
@@ -391,19 +745,17 @@ func testInvalidRootCertWithClientAuth(t *testing.T) {
 // Configure server to start with client authentication required
 func testClientAuth(t *testing.T) {
 	srv := getServer(rootPort, testdataDir, "", 0, t)
-	srv = getTLSConfig(srv, "RequireAndVerifyClientCert", "../testdata/root.pem")
+	srv = getTLSConfig(srv, "RequireAndVerifyClientCert", []string{"../testdata/root.pem"})
 
 	err := srv.Start()
 	if err != nil {
 		t.Fatalf("Root server start failed: %s", err)
 	}
 
-	time.Sleep(time.Second)
-
 	clientConfig := &ClientConfig{
 		URL: fmt.Sprintf("https://localhost:%d", rootPort),
 		TLS: tls.ClientTLSConfig{
-			CertFilesList: []string{"../testdata/root.pem"},
+			CertFiles: []string{"../testdata/root.pem"},
 		},
 	}
 
@@ -419,7 +771,7 @@ func testClientAuth(t *testing.T) {
 	clientConfig = &ClientConfig{
 		URL: fmt.Sprintf("https://localhost:%d", rootPort),
 		TLS: tls.ClientTLSConfig{
-			CertFilesList: []string{"../testdata/root.pem"},
+			CertFiles: []string{"../testdata/root.pem"},
 			Client: tls.KeyCertFiles{
 				KeyFile:  "../testdata/tls_client-key.pem",
 				CertFile: "../testdata/tls_client-cert.pem",
@@ -448,14 +800,70 @@ func testIntermediateServer(idx int, t *testing.T) {
 	if err != nil {
 		t.Fatalf("Intermediate server init failed: %s", err)
 	}
+	// Verify that the duration of the newly created intermediate certificate is 5 years
+	d, err := util.GetCertificateDurationFromFile(path.Join(intermediateServer.HomeDir, "ca-cert.pem"))
+	assert.NoError(t, err)
+	assert.True(t, d.Hours() == 43800, fmt.Sprintf("Expecting 43800 but found %f", d.Hours()))
 	// Start it
 	err = intermediateServer.Start()
 	if err != nil {
 		t.Fatalf("Intermediate server start failed: %s", err)
 	}
-	time.Sleep(time.Second)
 	// Stop it
 	intermediateServer.Stop()
+}
+
+// TestSqliteLocking tests to ensure that "database is locked"
+// error does not occur when multiple requests are sent at the
+// same time.
+// This test assumes that sqlite is the database used in the tests
+func TestSqliteLocking(t *testing.T) {
+	// Start the server
+	server := getServer(rootPort, rootDir, "", 0, t)
+	if server == nil {
+		return
+	}
+	err := server.Start()
+	if err != nil {
+		t.Fatalf("Server start failed: %s", err)
+	}
+	defer server.Stop()
+
+	// Enroll bootstrap user
+	client := getRootClient()
+	eresp, err := client.Enroll(&api.EnrollmentRequest{
+		Name:   "admin",
+		Secret: "adminpw",
+	})
+	if err != nil {
+		t.Fatalf("Failed to enroll bootstrap user: %s", err)
+	}
+	admin := eresp.Identity
+	errs := make(chan error)
+	users := 30
+	// Register users
+	for i := 0; i < users; i++ {
+		n := "user" + strconv.Itoa(i)
+		go func(admin *Identity, name string) {
+			_, err := admin.Register(&api.RegistrationRequest{
+				Name:        name,
+				Type:        "user",
+				Affiliation: "hyperledger.fabric.security",
+			})
+			errs <- err
+		}(admin, n)
+	}
+	for i := 0; ; {
+		err = <-errs
+		// Should not see "database is locked" error
+		if err != nil && strings.Contains(err.Error(), "database is locked") {
+			t.Fatalf("Failed to register: %s", err)
+		}
+		// If we have heard from all the go routines, break to exit the test
+		if i++; i == users {
+			break
+		}
+	}
 }
 
 func TestEnd(t *testing.T) {
@@ -464,6 +872,28 @@ func TestEnd(t *testing.T) {
 	os.Remove("../testdata/fabric-ca-server.db")
 	os.RemoveAll(rootDir)
 	os.RemoveAll(intermediateDir)
+	os.RemoveAll("multica")
+	os.RemoveAll(serversDir)
+	os.RemoveAll("../testdata/msp")
+	cleanMultiCADir()
+}
+
+func cleanMultiCADir() {
+	caFolder := "../testdata/ca"
+	toplevelFolders := []string{"intermediateca", "rootca"}
+	nestedFolders := []string{"ca1", "ca2", "ca3"}
+	removeFiles := []string{"ca-cert.pem", "ca-key.pem", "fabric-ca-server.db", "fabric-ca2-server.db", "ca-chain.pem"}
+
+	for _, topFolder := range toplevelFolders {
+		for _, nestedFolder := range nestedFolders {
+			path := filepath.Join(caFolder, topFolder, nestedFolder)
+			for _, file := range removeFiles {
+				os.Remove(filepath.Join(path, file))
+			}
+			os.RemoveAll(filepath.Join(path, "msp"))
+		}
+	}
+
 }
 
 func getRootServerURL() string {
@@ -495,17 +925,26 @@ func getServer(port int, home, parentURL string, maxEnroll int, t *testing.T) *S
 		},
 		"org2": nil,
 	}
+
 	srv := &Server{
 		Config: &ServerConfig{
-			Port:         port,
-			Debug:        true,
-			Affiliations: affiliations,
-			Registry: ServerConfigRegistry{
-				MaxEnrollments: maxEnroll,
+			Port:  port,
+			Debug: true,
+		},
+		CA: CA{
+			Config: &CAConfig{
+				Intermediate: IntermediateCA{
+					ParentServer: ParentServer{
+						URL: parentURL,
+					},
+				},
+				Affiliations: affiliations,
+				Registry: CAConfigRegistry{
+					MaxEnrollments: maxEnroll,
+				},
 			},
 		},
-		HomeDir:         home,
-		ParentServerURL: parentURL,
+		HomeDir: home,
 	}
 	// The bootstrap user's affiliation is the empty string, which
 	// means the user is at the affiliation root
@@ -532,7 +971,7 @@ func getTestClient(port int) *Client {
 	}
 }
 
-func getTLSConfig(srv *Server, clientAuthType string, clientRootCerts string) *Server {
+func getTLSConfig(srv *Server, clientAuthType string, clientRootCerts []string) *Server {
 	srv.Config.TLS.Enabled = true
 	srv.Config.TLS.CertFile = "../testdata/tls_server-cert.pem"
 	srv.Config.TLS.KeyFile = "../testdata/tls_server-key.pem"
@@ -540,4 +979,77 @@ func getTLSConfig(srv *Server, clientAuthType string, clientRootCerts string) *S
 	srv.Config.TLS.ClientAuth.CertFiles = clientRootCerts
 
 	return srv
+}
+
+func testRegistration(admin *Identity, t *testing.T) {
+	name := "testRegistrationUser1"
+	topAffiliation := "hyperledger"
+	midAffiliation := "hyperledger.fabric"
+	botAffiliation := "hyperledger.fabric.security"
+	_, err := admin.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: midAffiliation,
+		Attributes:  makeAttrs(t, "hf.Registrar.Roles=user", "hf.Registrar.DelegateRoles=user,peer"),
+	})
+	if err == nil {
+		t.Error("Should have failed to register delegate roles which exceed roles")
+	}
+	id1, err := admin.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: midAffiliation,
+		Attributes:  makeAttrs(t, "hf.Registrar.Roles=user,peer", "hf.Registrar.DelegateRoles=user"),
+	})
+	if err != nil {
+		t.Fatalf("Failed to register %s: %s", name, err)
+	}
+	_, err = id1.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: botAffiliation,
+		Attributes:  makeAttrs(t, "hf.Registrar.Roles=peer"),
+	})
+	if err == nil {
+		t.Error("ID1 should not be allowed to delegate peer registration to another identity")
+	}
+	_, err = id1.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: topAffiliation,
+	})
+	if err == nil {
+		t.Error("ID1 should not be allowed to registrar outside of its affiliation hierarchy")
+	}
+	name = "testRegistrationUser2"
+	id2, err := id1.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: botAffiliation,
+	})
+	if err != nil {
+		t.Fatalf("ID1 failed to register %s: %s", name, err)
+	}
+	name = "testRegistrationUser3"
+	_, err = id2.RegisterAndEnroll(&api.RegistrationRequest{
+		Name:        name,
+		Type:        "user",
+		Affiliation: botAffiliation,
+	})
+	if err == nil {
+		t.Error("ID2 should not be allowed to register")
+	}
+}
+
+func makeAttrs(t *testing.T, args ...string) []api.Attribute {
+	attrs := make([]api.Attribute, len(args))
+	for idx, attr := range args {
+		eles := strings.Split(attr, "=")
+		if len(eles) != 2 {
+			t.Fatalf("Not two elements in %s", attr)
+		}
+		attrs[idx].Name = eles[0]
+		attrs[idx].Value = eles[1]
+	}
+	return attrs
 }

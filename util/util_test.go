@@ -18,16 +18,25 @@ package util
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"math/big"
+
 	"github.com/hyperledger/fabric/bccsp/factory"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestMain(m *testing.M) {
+	factory.InitFactories(nil)
+	os.Exit(m.Run())
+}
 
 func TestGetEnrollmentIDFromPEM(t *testing.T) {
 	cert, err := ioutil.ReadFile(getPath("ec.pem"))
@@ -42,16 +51,19 @@ func TestGetEnrollmentIDFromPEM(t *testing.T) {
 
 func TestECCreateToken(t *testing.T) {
 	cert, _ := ioutil.ReadFile(getPath("ec.pem"))
-	privKey, _ := ioutil.ReadFile(getPath("ec-key.pem"))
+	bccsp := GetDefaultBCCSP()
+	privKey, err := ImportBCCSPKeyFromPEM(getPath("ec-key.pem"), bccsp, true)
+	if err != nil {
+		t.Logf("Failed importing key %s", err)
+	}
 	body := []byte("request byte array")
 
-	csp := factory.GetDefault()
-	ECtoken, err := CreateToken(csp, cert, privKey, body)
+	ECtoken, err := CreateToken(bccsp, cert, privKey, body)
 	if err != nil {
 		t.Fatalf("CreatToken failed: %s", err)
 	}
 
-	_, err = VerifyToken(csp, ECtoken, body)
+	_, err = VerifyToken(bccsp, ECtoken, body)
 	if err != nil {
 		t.Fatalf("VerifyToken failed: %s", err)
 	}
@@ -61,19 +73,19 @@ func TestECCreateToken(t *testing.T) {
 		t.Fatal("VerifyToken should have failed as no instance of csp is passed")
 	}
 
-	_, err = VerifyToken(csp, "", body)
+	_, err = VerifyToken(bccsp, "", body)
 	if err == nil {
 		t.Fatal("VerifyToken should have failed as no EC Token is passed")
 	}
 
-	_, err = VerifyToken(csp, ECtoken, nil)
+	_, err = VerifyToken(bccsp, ECtoken, nil)
 	if err == nil {
 		t.Fatal("VerifyToken should have failed as no EC Token is passed")
 	}
 
 	verifiedByte := []byte("TEST")
 	body = append(body, verifiedByte[0])
-	_, err = VerifyToken(csp, ECtoken, body)
+	_, err = VerifyToken(bccsp, ECtoken, body)
 	if err == nil {
 		t.Fatal("VerifyToken should have failed as body was tampered")
 	}
@@ -82,7 +94,7 @@ func TestECCreateToken(t *testing.T) {
 	if skierror != nil {
 		t.Fatalf("SKI File Read failed with error : %s", skierror)
 	}
-	ECtoken, err = CreateToken(csp, ski, privKey, body)
+	ECtoken, err = CreateToken(bccsp, ski, privKey, body)
 	if (err == nil) || (ECtoken != "") {
 		t.Fatal("CreatToken should have failed as certificate passed is not correct")
 	}
@@ -140,11 +152,10 @@ func TestRSACreateToken(t *testing.T) {
 
 func TestCreateTokenDiffKey(t *testing.T) {
 	cert, _ := ioutil.ReadFile(getPath("ec.pem"))
-	privKey, _ := ioutil.ReadFile(getPath("rsa-key.pem"))
+	bccsp := GetDefaultBCCSP()
+	privKey, _ := ImportBCCSPKeyFromPEM(getPath("rsa-key.pem"), bccsp, true)
 	body := []byte("request byte array")
-
-	csp := factory.GetDefault()
-	_, err := CreateToken(csp, cert, privKey, body)
+	_, err := CreateToken(bccsp, cert, privKey, body)
 	if err == nil {
 		t.Fatalf("TestCreateTokenDiffKey passed but should have failed")
 	}
@@ -182,29 +193,27 @@ func TestEmptyCert(t *testing.T) {
 	body := []byte("request byte array")
 
 	csp := factory.GetDefault()
-	_, err := CreateToken(csp, cert, []byte(""), body)
+	_, err := CreateToken(csp, cert, nil, body)
 	if err == nil {
 		t.Fatalf("TestEmptyCert passed but should have failed")
 	}
 }
 
 func TestEmptyKey(t *testing.T) {
-	privKey, _ := ioutil.ReadFile(getPath("ec-key.pem"))
+	bccsp := GetDefaultBCCSP()
+	privKey, _ := ImportBCCSPKeyFromPEM(getPath("ec-key.pem"), bccsp, true)
 	body := []byte("request byte array")
-
-	csp := factory.GetDefault()
-	_, err := CreateToken(csp, []byte(""), privKey, body)
+	_, err := CreateToken(bccsp, []byte(""), privKey, body)
 	if err == nil {
 		t.Fatalf("TestEmptyKey passed but should have failed")
 	}
 }
 
 func TestEmptyBody(t *testing.T) {
+	bccsp := GetDefaultBCCSP()
+	privKey, _ := ImportBCCSPKeyFromPEM(getPath("ec-key.pem"), bccsp, true)
 	cert, _ := ioutil.ReadFile(getPath("ec.pem"))
-	privKey, _ := ioutil.ReadFile(getPath("ec-key.pem"))
-
-	csp := factory.GetDefault()
-	_, err := CreateToken(csp, cert, privKey, []byte(""))
+	_, err := CreateToken(bccsp, cert, privKey, []byte(""))
 	if err != nil {
 		t.Fatalf("CreateToken failed: %s", err)
 	}
@@ -258,6 +267,7 @@ func TestGetDefaultConfigFile(t *testing.T) {
 	os.Unsetenv("FABRIC_CA_HOME")
 	os.Unsetenv("FABRIC_CA_CLIENT_HOME")
 	os.Unsetenv("FABRIC_CA_SERVER_HOME")
+	os.Unsetenv("CA_CFG_PATH")
 
 	const clientConfig = "fabric-ca-client-config.yaml"
 	const serverConfig = "fabric-ca-server-config.yaml"
@@ -366,10 +376,30 @@ func TestFileExists(t *testing.T) {
 }
 
 func TestMakeFileAbs(t *testing.T) {
-	makeFileAbs(t, "", "", "")
-	makeFileAbs(t, "/a/b/c", "", "/a/b/c")
-	makeFileAbs(t, "c", "/a/b", "/a/b/c")
-	makeFileAbs(t, "../c", "/a/b", "/a/c")
+	testMakeFileAbs(t, "", "", "")
+	testMakeFileAbs(t, "/a/b/c", "", "/a/b/c")
+	testMakeFileAbs(t, "c", "/a/b", "/a/b/c")
+	testMakeFileAbs(t, "../c", "/a/b", "/a/c")
+}
+
+func TestMakeFilesAbs(t *testing.T) {
+	file1 := "a"
+	file2 := "a/b"
+	file3 := "/a/b"
+	files := []*string{&file1, &file2, &file3}
+	err := MakeFileNamesAbsolute(files, "/tmp")
+	if err != nil {
+		t.Fatalf("MakeFilesAbsolute failed: %s", err)
+	}
+	if file1 != "/tmp/a" {
+		t.Errorf("TestMakeFilesAbs failure: expecting /tmp/a but found %s", file1)
+	}
+	if file2 != "/tmp/a/b" {
+		t.Errorf("TestMakeFilesAbs failure: expecting /tmp/a/b but found %s", file2)
+	}
+	if file3 != "/a/b" {
+		t.Errorf("TestMakeFilesAbs failure: expecting /a/b but found %s", file3)
+	}
 }
 
 func TestB64(t *testing.T) {
@@ -387,12 +417,22 @@ func TestB64(t *testing.T) {
 func TestGetUser(t *testing.T) {
 	os.Unsetenv("FABRIC_CA_CLIENT_URL")
 	viper.BindEnv("url", "FABRIC_CA_CLIENT_URL")
+	os.Setenv("FABRIC_CA_CLIENT_URL", "http://localhost:7054")
+	_, _, err := GetUser()
+	assert.Error(t, err, "Should have failed no username and password provided")
+
+	os.Setenv("FABRIC_CA_CLIENT_URL", "http://:pass@localhost:7054")
+	_, _, err = GetUser()
+	assert.Error(t, err, "Should have failed no username provided")
+
+	os.Setenv("FABRIC_CA_CLIENT_URL", "http://user:@localhost:7054")
+	_, _, err = GetUser()
+	assert.Error(t, err, "Should have failed no password provided")
+
 	os.Setenv("FABRIC_CA_CLIENT_URL", "http://foo:bar@localhost:7054")
 
 	user, pass, err := GetUser()
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	if user != "foo" {
 		t.Error("Failed to retrieve correct username")
@@ -429,7 +469,33 @@ func TestStructToString(t *testing.T) {
 	}
 }
 
-func makeFileAbs(t *testing.T, file, dir, expect string) {
+func TestNormalizeFileList(t *testing.T) {
+	var err error
+	slice := []string{"file1,file2", "file3,file4"}
+
+	slice, err = NormalizeFileList(slice, "../testdata")
+	if err != nil {
+		t.Error("Failed to normalize files list, error: ", err)
+	}
+
+	if !strings.Contains(slice[0], "file1") {
+		t.Error("Failed to correctly normalize files list")
+	}
+
+	if strings.Contains(slice[0], "file2") {
+		t.Error("Should have failed, first element should not contain 'file2'")
+	}
+
+	if !strings.Contains(slice[1], "file2") {
+		t.Error("Failed to correctly normalize files list")
+	}
+
+	if !strings.Contains(slice[3], "file4") {
+		t.Error("Failed to correctly normalize files list")
+	}
+}
+
+func testMakeFileAbs(t *testing.T, file, dir, expect string) {
 	path, err := MakeFileAbs(file, dir)
 	if err != nil {
 		t.Errorf("Failed to make %s absolute: %s", file, err)
@@ -440,5 +506,89 @@ func makeFileAbs(t *testing.T, file, dir, expect string) {
 	}
 	if path != expect {
 		t.Errorf("Absolute of file=%s with dir=%s expected %s but was %s", file, dir, expect, path)
+	}
+}
+
+func TestRemoveQuotesInvalidArgs(t *testing.T) {
+	res := RemoveQuotes("")
+	assert.Equal(t, "", res)
+}
+
+func TestUnmarshalInvalidArgs(t *testing.T) {
+	err := Unmarshal(nil, nil, "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed to unmarshal ")
+}
+
+func TestStrContainedInvalidArgs(t *testing.T) {
+	res := StrContained("Hello World", nil)
+	assert.False(t, res)
+}
+
+func TestGetSerialAsHex(t *testing.T) {
+	res := GetSerialAsHex(big.NewInt(101))
+	assert.Equal(t, "65", res)
+}
+
+func TestECPrivateKey(t *testing.T) {
+	_, err := GetECPrivateKey(getPEM("../testdata/ec-key.pem", t))
+	assert.NoError(t, err)
+}
+
+func TestPKCS8WrappedECPrivateKey(t *testing.T) {
+	_, err := GetECPrivateKey(getPEM("../testdata/pkcs8eckey.pem", t))
+	assert.NoError(t, err)
+}
+
+func TestRSAPrivateKey(t *testing.T) {
+	_, err := GetRSAPrivateKey(getPEM("../testdata/rsa-key.pem", t))
+	assert.NoError(t, err)
+}
+
+func TestCheckHostsInCert(t *testing.T) {
+	err := CheckHostsInCert("../testdata/doesnotexist.pem", "")
+	assert.Error(t, err)
+
+	err = CheckHostsInCert("../testdata/tls_server-cert.pem", "localhost")
+	assert.NoError(t, err, fmt.Sprintf("Failed to find 'localhost' for host in certificate: %s", err))
+
+	err = CheckHostsInCert("../testdata/tls_server-cert.pem", "fakehost")
+	assert.Error(t, err, "Certificate does not contain 'fakehost', should have failed")
+
+	err = CheckHostsInCert("../testdata/root.pem", "x")
+	assert.Error(t, err, "Certificate contained no host, should have failed")
+}
+
+func TestCertDuration(t *testing.T) {
+	d, err := GetCertificateDurationFromFile("../testdata/ec.pem")
+	assert.NoError(t, err)
+	assert.True(t, d.Hours() == 43800, "Expected certificate duration of 43800h in ec.pem")
+	_, err = GetCertificateDurationFromFile("bogus.pem")
+	assert.Error(t, err)
+}
+
+func getPEM(file string, t *testing.T) []byte {
+	buf, err := ioutil.ReadFile(file)
+	assert.NoError(t, err)
+	return buf
+}
+
+func TestIsSubsetOf(t *testing.T) {
+	testIsSubsetOf(t, "a,b", "b,a,c", true)
+	testIsSubsetOf(t, "a,b", "b,a", true)
+	testIsSubsetOf(t, "a,b,c", "a,b", false)
+	testIsSubsetOf(t, "a,b,c", "", false)
+}
+
+func testIsSubsetOf(t *testing.T, small, large string, expectToPass bool) {
+	err := IsSubsetOf(small, large)
+	if expectToPass {
+		if err != nil {
+			t.Errorf("IsSubsetOf('%s','%s') failed: %s", small, large, err)
+		}
+	} else {
+		if err == nil {
+			t.Errorf("IsSubsetOf('%s','%s') expected error but passed", small, large)
+		}
 	}
 }

@@ -46,7 +46,6 @@ type revokeHandler struct {
 
 // Handle an revoke request
 func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
-
 	log.Debug("Revoke request received")
 
 	authHdr := r.Header.Get("authorization")
@@ -60,20 +59,6 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 	}
 	r.Body.Close()
 
-	cert, err := util.VerifyToken(h.server.csp, authHdr, body)
-	if err != nil {
-		return authErr(w, err)
-	}
-
-	// Make sure that the user has the "hf.Revoker" attribute in order to be authorized
-	// to revoke a certificate.  This attribute comes from the user registry, which
-	// is either in the DB if LDAP is not configured, or comes from LDAP if LDAP is
-	// configured.
-	err = h.server.userHasAttribute(cert.Subject.CommonName, "hf.Revoker")
-	if err != nil {
-		return authErr(w, err)
-	}
-
 	// Parse revoke request body
 	var req api.RevocationRequestNet
 	err = json.Unmarshal(body, &req)
@@ -83,11 +68,28 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 
 	log.Debugf("Revoke request: %+v", req)
 
+	caname := r.Header.Get(caHdrName)
+
+	cert, err := util.VerifyToken(h.server.caMap[caname].csp, authHdr, body)
+	if err != nil {
+		return authErr(w, err)
+	}
+
+	// Make sure that the user has the "hf.Revoker" attribute in order to be authorized
+	// to revoke a certificate.  This attribute comes from the user registry, which
+	// is either in the DB if LDAP is not configured, or comes from LDAP if LDAP is
+	// configured.
+	err = h.server.caMap[caname].userHasAttribute(cert.Subject.CommonName, "hf.Revoker")
+	if err != nil {
+		return authErr(w, err)
+	}
+
 	req.AKI = strings.TrimLeft(strings.ToLower(req.AKI), "0")
 	req.Serial = strings.TrimLeft(strings.ToLower(req.Serial), "0")
 
-	certDBAccessor := h.server.certDBAccessor
-	registry := h.server.registry
+	certDBAccessor := h.server.caMap[caname].certDBAccessor
+	registry := h.server.caMap[caname].registry
+	reason := util.RevocationReasonCodes[req.Reason]
 
 	if req.Serial != "" && req.AKI != "" {
 		certificate, err := certDBAccessor.GetCertificateWithID(req.Serial, req.AKI)
@@ -97,17 +99,26 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 			return notFound(w, errors.New(msg))
 		}
 
+		if req.Name != "" && req.Name != certificate.ID {
+			err = fmt.Errorf("The serial number %s and the AKI %s do not belong to the Enrollment ID %s",
+				req.Serial, req.AKI, req.Name)
+			return badRequest(w, err)
+		}
+
 		userInfo, err2 := registry.GetUserInfo(certificate.ID)
 		if err2 != nil {
-			return err2
+			msg := fmt.Sprintf("Failed to find user: %s", err2)
+			log.Errorf(msg)
+			return dbErr(w, errors.New(msg))
 		}
 
-		err2 = h.checkAffiliations(cert.Subject.CommonName, userInfo.Affiliation)
+		err2 = h.checkAffiliations(cert.Subject.CommonName, userInfo, caname)
 		if err2 != nil {
-			return err2
+			log.Error(err2)
+			return authErr(w, err2)
 		}
 
-		err = certDBAccessor.RevokeCertificate(req.Serial, req.AKI, req.Reason)
+		err = certDBAccessor.RevokeCertificate(req.Serial, req.AKI, reason)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to revoke certificate: %s", err)
 			log.Error(msg)
@@ -117,7 +128,7 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 
 		user, err := registry.GetUser(req.Name, nil)
 		if err != nil {
-			err = fmt.Errorf("Failed to get user %s: %s", req.Name, err)
+			err = fmt.Errorf("Failed to get identity %s: %s", req.Name, err)
 			return notFound(w, err)
 		}
 
@@ -126,13 +137,14 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 			var userInfo spi.UserInfo
 			userInfo, err = registry.GetUserInfo(req.Name)
 			if err != nil {
-				err = fmt.Errorf("Failed to get user info %s: %s", req.Name, err)
+				err = fmt.Errorf("Failed to get identity info %s: %s", req.Name, err)
 				return notFound(w, err)
 			}
 
-			err = h.checkAffiliations(cert.Subject.CommonName, userInfo.Affiliation)
+			err = h.checkAffiliations(cert.Subject.CommonName, userInfo, caname)
 			if err != nil {
-				return err
+				log.Error(err)
+				return authErr(w, err)
 			}
 
 			userInfo.State = -1
@@ -145,14 +157,14 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		var recs []CertRecord
-		recs, err = certDBAccessor.RevokeCertificatesByID(req.Name, req.Reason)
+		recs, err = certDBAccessor.RevokeCertificatesByID(req.Name, reason)
 		if err != nil {
 			log.Warningf("No certificates were revoked for '%s' but the ID was disabled: %s", req.Name, err)
 			return dbErr(w, err)
 		}
 
 		if len(recs) == 0 {
-			log.Warningf("No certificates were revoked for '%s' but the ID was disabled: %s", req.Name)
+			log.Warningf("No certificates were revoked for '%s' but the ID was disabled", req.Name)
 		}
 
 		log.Debugf("Revoked the following certificates owned by '%s': %+v", req.Name, recs)
@@ -167,17 +179,28 @@ func (h *revokeHandler) Handle(w http.ResponseWriter, r *http.Request) error {
 	return cfsslapi.SendResponse(w, result)
 }
 
-func (h *revokeHandler) checkAffiliations(revoker string, affiliation string) error {
-	log.Debugf("Check to see if revoker %s has affiliations to revoke: %s", revoker, affiliation)
-	revokerAffiliation, err := h.server.getUserAffiliation(revoker)
+func (h *revokeHandler) checkAffiliations(revoker string, revoking spi.UserInfo, caname string) error {
+	log.Debugf("Check to see if revoker %s has affiliations to revoke: %s", revoker, revoking.Name)
+	userAffiliation, err := h.server.caMap[caname].getUserAffiliation(revoker)
 	if err != nil {
 		return err
 	}
 
-	log.Debugf("Affiliation of revoker: %s, affiliation of user being revoked: %s", revokerAffiliation, affiliation)
+	log.Debugf("Affiliation of revoker: %s, affiliation of identity being revoked: %s", userAffiliation, revoking.Affiliation)
 
-	if !strings.HasPrefix(affiliation, revokerAffiliation) {
-		return fmt.Errorf("Revoker %s does not have proper affiliation to revoke user", revoker)
+	// Revoking user has root affiliation thus has ability to revoke
+	if userAffiliation == "" {
+		log.Debug("Identity with root affiliation revoking")
+		return nil
+	}
+
+	revokingAffiliation := strings.Split(revoking.Affiliation, ".")
+	revokerAffiliation := strings.Split(userAffiliation, ".")
+	for i := range revokerAffiliation {
+		if revokerAffiliation[i] != revokingAffiliation[i] {
+			return fmt.Errorf("Revoker %s does not have proper affiliation to revoke identity %s", revoker, revoking.Name)
+		}
+
 	}
 
 	return nil

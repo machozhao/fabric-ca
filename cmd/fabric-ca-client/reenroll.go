@@ -29,9 +29,15 @@ import (
 // initCmd represents the init command
 var reenrollCmd = &cobra.Command{
 	Use:   "reenroll",
-	Short: "Reenroll user",
-	Long:  "Reenroll user with fabric-ca server",
+	Short: "Reenroll an identity",
+	Long:  "Reenroll an identity with fabric-ca server",
+	// PreRunE block for this command will check to make sure enrollment
+	// information exists before running the command
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf(extraArgsError, args, cmd.UsageString())
+		}
+
 		err := configInit(cmd.Name())
 		if err != nil {
 			return err
@@ -42,11 +48,6 @@ var reenrollCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) > 0 {
-			cmd.Help()
-			return nil
-		}
-
 		err := runReenroll()
 		if err != nil {
 			return err
@@ -75,10 +76,10 @@ func runReenroll() error {
 	}
 
 	req := &api.ReenrollmentRequest{
-		Hosts:   clientCfg.Enrollment.Hosts,
 		Label:   clientCfg.Enrollment.Label,
 		Profile: clientCfg.Enrollment.Profile,
 		CSR:     &clientCfg.CSR,
+		CAName:  clientCfg.CAName,
 	}
 
 	resp, err := id.Reenroll(req)

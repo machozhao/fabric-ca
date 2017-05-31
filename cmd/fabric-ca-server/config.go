@@ -36,6 +36,7 @@ const (
 	cmdName      = "fabric-ca-server"
 	envVarPrefix = "FABRIC_CA_SERVER"
 	homeEnvVar   = "FABRIC_CA_SERVER_HOME"
+	caNameReqMsg = "ca.name property is required but is missing from the configuration file"
 )
 
 const (
@@ -67,9 +68,10 @@ const (
 #
 #   FILE NAME ELEMENTS
 #   ------------------
-#   All filename elements below end with the word "file".
-#   For example, see "certfile" and "keyfile" in the "ca" section.
-#   The value of each filename element can be a simple filename, a
+#   The value of all fields whose name ends with "file" or "files" are
+#   name or names of other files.
+#   For example, see "tls.certfile" and "tls.clientauth.certfiles".
+#   The value of each of these fields can be a simple filename, a
 #   relative path, or an absolute path.  If the value is not an
 #   absolute path, it is interpretted as being relative to the location
 #   of this configuration file.
@@ -100,7 +102,7 @@ tls:
   keyfile: ca-key.pem
   clientauth:
     type: noclientcert
-    certfiles: 			# Comma Separated list of root certificate files (e.g. root.pem, root2.pem)
+    certfiles:
 
 #############################################################################
 #  The CA section contains information related to the Certificate Authority
@@ -114,7 +116,7 @@ tls:
 #############################################################################
 ca:
   # Name of this CA
-  name: <<<CANAME>>>
+  name:
   # Key file (default: ca-key.pem)
   keyfile: ca-key.pem
   # Certificate file (default: ca-cert.pem)
@@ -141,7 +143,7 @@ registry:
   # (default: 0, which means there is no limit)
   maxEnrollments: 0
 
-  # Contains user information which is used when LDAP is disabled
+  # Contains identity information which is used when LDAP is disabled
   identities:
      - name: <<<ADMIN>>>
        pass: <<<ADMINPW>>>
@@ -168,7 +170,8 @@ db:
   datasource: fabric-ca-server.db
   tls:
       enabled: false
-      certfiles: db-server-cert.pem			# Comma Separated (e.g. root.pem, root2.pem)
+      certfiles:
+        - db-server-cert.pem
       client:
         certfile: db-client-cert.pem
         keyfile: db-client-key.pem
@@ -186,7 +189,8 @@ ldap:
    # The URL of the LDAP server
    url: ldap://<adminDN>:<adminPassword>@<host>:<port>/<base>
    tls:
-      certfiles: ldap-server-cert.pem				# Comma Separated (e.g. root.pem, root2.pem)
+      certfiles:
+        - ldap-server-cert.pem
       client:
          certfile: ldap-client-cert.pem
          keyfile: ldap-client-key.pem
@@ -203,22 +207,33 @@ affiliations:
 
 #############################################################################
 #  Signing section
+#
+#  The "default" subsection is used to sign enrollment certificates;
+#  the default expiration ("expiry" field) is "8760h", which is 1 year in hours.
+#
+#  The "ca" profile subsection is used to sign intermediate CA certificates;
+#  the default expiration ("expiry" field) is "43800h" which is 5 years in hours.
+#  Note that "isca" is true, meaning that it issues a CA certificate.
 #############################################################################
 signing:
+    default:
+      usage:
+        - cert sign
+      expiry: 8760h
     profiles:
       ca:
          usage:
            - cert sign
-         expiry: 8000h
+         expiry: 43800h
          caconstraint:
            isca: true
-    default:
-      usage:
-        - cert sign
-      expiry: 8000h
 
 ###########################################################################
-#  Certificate Signing Request section for generating the CA certificate
+#  Certificate Signing Request (CSR) section.
+#  This controls the creation of the root CA certificate.
+#  The expiration for the root CA certificate is configured with the
+#  "ca.expiry" field below, whose default value is "131400h" which is
+#  15 years in hours.
 ###########################################################################
 csr:
    cn: fabric-ca-server
@@ -230,20 +245,102 @@ csr:
         OU: Fabric
    hosts:
      - <<<MYHOST>>>
+     - localhost
    ca:
       pathlen:
       pathlenzero:
-      expiry:
+      expiry: 131400h
 
 #############################################################################
-#  Crypto section configures the crypto primitives used for all
+# BCCSP (BlockChain Crypto Service Provider) section is used to select which
+# crypto library implementation to use
 #############################################################################
-crypto:
-  software:
-     hash_family: SHA2
-     security_level: 256
-     ephemeral: false
-     key_store_dir: keys
+
+bccsp:
+    default: SW
+    sw:
+        hash: SHA2
+        security: 256
+        filekeystore:
+            # The directory used for the software file-based keystore
+            keystore: msp/keystore
+
+#############################################################################
+# Multi CA section
+#
+# Each Fabric CA server contains one CA by default.  This section is used
+# to configure multiple CAs in a single server.
+#
+# 1) --cacount <number-of-CAs>
+# Automatically generate <number-of-CAs> non-default CAs.  The names of these
+# additional CAs are "ca1", "ca2", ... "caN", where "N" is <number-of-CAs>
+# This is particularly useful in a development environment to quickly set up
+# multiple CAs.
+#
+# 2) --cafiles <CA-config-files>
+# For each CA config file in the list, generate a separate signing CA.  Each CA
+# config file in this list MAY contain all of the same elements as are found in
+# the server config file except port, debug, and tls sections.
+# 
+# Examples:
+# fabric-ca-server start -b admin:adminpw --cacount 2
+#
+# fabric-ca-server start -b admin:adminpw --cafiles ca/ca1/fabric-ca-server-config.yaml
+# --cafiles ca/ca2/fabric-ca-server-config.yaml
+#
+#############################################################################
+
+cacount:
+
+cafiles:
+
+#############################################################################
+# Intermediate CA section
+#
+# The relationship between servers and CAs is as follows:
+#   1) A single server process may contain or function as one or more CAs.
+#      This is configured by the "Multi CA section" above.
+#   2) Each CA is either a root CA or an intermediate CA.
+#   3) Each intermediate CA has a parent CA which is either a root CA or another intermediate CA.
+#
+# This section pertains to configuration of #2 and #3.
+# If the "intermediate.parentserver.url" property is set,
+# then this is an intermediate CA with the specified parent
+# CA.
+#
+# parentserver section
+#    url - The URL of the parent server
+#    caname - Name of the CA to enroll within the server
+#
+# enrollment section used to enroll intermediate CA with parent CA
+#    hosts - A comma-separated list of host names which the certificate should
+#    be valid for
+#    profile - Name of the signing profile to use in issuing the certificate
+#    label - Label to use in HSM operations
+#
+# tls section for secure socket connection
+#   certfiles - PEM-encoded list of trusted root certificate files
+#   client:
+#     certfile - PEM-encoded certificate file for when client authentication
+#     is enabled on server
+#     keyfile - PEM-encoded key file for when client authentication
+#     is enabled on server
+#############################################################################
+intermediate:
+  parentserver:
+    url:
+    caname:
+
+  enrollment:
+    hosts:
+    profile:
+    label:
+
+  tls:
+    certfiles:
+    client:
+      certfile:
+      keyfile:
 `
 )
 
@@ -277,17 +374,11 @@ func configInit() (err error) {
 	}
 
 	// Read the config
-	viper.SetConfigFile(cfgFileName)
+	// viper.SetConfigFile(cfgFileName)
 	viper.AutomaticEnv() // read in environment variables that match
-	err = viper.ReadInConfig()
+	err = lib.UnmarshalConfig(serverCfg, viper.GetViper(), cfgFileName, true, true)
 	if err != nil {
-		return fmt.Errorf("Failed to read config file: %s", err)
-	}
-
-	// Unmarshal the config into 'serverCfg'
-	err = viper.Unmarshal(serverCfg)
-	if err != nil {
-		return fmt.Errorf("Incorrect format in file '%s': %s", cfgFileName, err)
+		return err
 	}
 
 	return nil
@@ -310,28 +401,51 @@ func createDefaultConfigFile() error {
 	user := ups[0]
 	pass := ups[1]
 	if len(user) >= 1024 {
-		return fmt.Errorf("The user name must be less than 1024 characters: '%s'", user)
+		return fmt.Errorf("The identity name must be less than 1024 characters: '%s'", user)
 	}
 	if len(pass) == 0 {
 		return errors.New("An empty password in the '-b user:pass' option is not permitted")
 	}
-	// Get hostname
-	myhost, err := os.Hostname()
+
+	var myhost string
+	var err error
+	myhost, err = os.Hostname()
 	if err != nil {
 		return err
 	}
-	// Get domain name
-	mydomain := strings.Join(strings.Split(myhost, ".")[1:], ".")
+
 	// Do string subtitution to get the default config
 	cfg := strings.Replace(defaultCfgTemplate, "<<<ADMIN>>>", user, 1)
 	cfg = strings.Replace(cfg, "<<<ADMINPW>>>", pass, 1)
 	cfg = strings.Replace(cfg, "<<<MYHOST>>>", myhost, 1)
-	cfg = strings.Replace(cfg, "<<<CANAME>>>", mydomain, 1)
+
 	// Now write the file
-	err = os.MkdirAll(filepath.Dir(cfgFileName), 0755)
+	cfgDir := filepath.Dir(cfgFileName)
+	err = os.MkdirAll(cfgDir, 0755)
 	if err != nil {
 		return err
 	}
+
 	// Now write the file
 	return ioutil.WriteFile(cfgFileName, []byte(cfg), 0644)
+}
+
+// getCAName returns CA Name
+// If ca.name property is specified (via the environment variable
+// 'FABRIC_CA_SERVER_CA_NAME' or the command line option '--ca.name' or
+// in the configuration file), then its value is returned
+// If ca.name property is not specified, domain is extracted from the hostname and is
+// returned
+// If domain is empty, then hostname is returned
+func getCAName(hostname string) (caName string) {
+	caName = viper.GetString("ca.name")
+	if caName != "" {
+		return caName
+	}
+
+	caName = strings.Join(strings.Split(hostname, ".")[1:], ".")
+	if caName == "" {
+		caName = hostname
+	}
+	return caName
 }

@@ -18,24 +18,29 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 
 	"github.com/cloudflare/cfssl/log"
 	"github.com/hyperledger/fabric-ca/api"
 	"github.com/hyperledger/fabric-ca/lib"
-	"github.com/hyperledger/fabric-ca/util"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
-var errInput = errors.New("Invalid usage; either --eid or both --serial and --aki are required")
+var errInput = errors.New("Invalid usage; either --revoke.name and/or both --revoke.serial and --revoke.aki are required")
 
 // initCmd represents the init command
 var revokeCmd = &cobra.Command{
 	Use:   "revoke",
-	Short: "Revoke user",
-	Long:  "Revoke user with fabric-ca server",
+	Short: "Revoke an identity",
+	Long:  "Revoke an identity with fabric-ca server",
+	// PreRunE block for this command will check to make sure enrollment
+	// information exists before running the command
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf(extraArgsError, args, cmd.UsageString())
+		}
+
 		err := configInit(cmd.Name())
 		if err != nil {
 			return err
@@ -46,11 +51,6 @@ var revokeCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) > 0 {
-			cmd.Help()
-			return nil
-		}
-
 		err := runRevoke(cmd)
 		if err != nil {
 			return err
@@ -62,11 +62,6 @@ var revokeCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(revokeCmd)
-	revokeFlags := revokeCmd.Flags()
-	util.FlagString(revokeFlags, "eid", "e", "", "Enrollment ID (Optional)")
-	util.FlagString(revokeFlags, "serial", "s", "", "Serial Number")
-	util.FlagString(revokeFlags, "aki", "a", "", "AKI")
-	util.FlagString(revokeFlags, "reason", "r", "", "Reason for revoking")
 }
 
 // The client revoke main logic
@@ -74,10 +69,6 @@ func runRevoke(cmd *cobra.Command) error {
 	log.Debug("Revoke Entered")
 
 	var err error
-
-	enrollmentID := viper.GetString("eid")
-	serial := viper.GetString("serial")
-	aki := viper.GetString("aki")
 
 	client := lib.Client{
 		HomeDir: filepath.Dir(cfgFileName),
@@ -89,30 +80,23 @@ func runRevoke(cmd *cobra.Command) error {
 		return err
 	}
 
-	if enrollmentID == "" {
-		if serial == "" || aki == "" {
-			cmd.Usage()
-			return errInput
-		}
-	} else {
-		if serial != "" || aki != "" {
-			cmd.Usage()
-			return errInput
-		}
-	}
-
-	reasonInput := viper.GetString("reason")
-	var reason int
-	if reasonInput != "" {
-		reason = util.RevocationReasonCodes[reasonInput]
+	// aki and serial # are required to revoke a certificate. The enrollment ID
+	// is required to revoke an identity. So, either aki and serial must be
+	// specified OR enrollment ID must be specified, else return an error.
+	// Note that all three can be specified, in which case server will revoke
+	// certificate associated with the specified aki, serial number.
+	if (clientCfg.Revoke.Name == "") && (clientCfg.Revoke.AKI == "" || clientCfg.Revoke.Serial == "") {
+		cmd.Usage()
+		return errInput
 	}
 
 	err = id.Revoke(
 		&api.RevocationRequest{
-			Name:   enrollmentID,
-			Serial: serial,
-			AKI:    aki,
-			Reason: reason,
+			Name:   clientCfg.Revoke.Name,
+			Serial: clientCfg.Revoke.Serial,
+			AKI:    clientCfg.Revoke.AKI,
+			Reason: clientCfg.Revoke.Reason,
+			CAName: clientCfg.CAName,
 		})
 
 	if err == nil {

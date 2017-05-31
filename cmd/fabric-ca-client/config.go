@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/cloudflare/cfssl/log"
+	"github.com/hyperledger/fabric-ca/api"
 	"github.com/hyperledger/fabric-ca/lib"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/spf13/viper"
@@ -66,9 +67,10 @@ const (
 #
 #   FILE NAME ELEMENTS
 #   ------------------
-#   All filename elements below end with the word "file".
-#   For example, see "certfile" and "keyfile" in the "ca" section.
-#   The value of each filename element can be a simple filename, a
+#   The value of all fields whose name ends with "file" or "files" are
+#   name or names of other files.
+#   For example, see "tls.certfiles" and "tls.client.certfile".
+#   The value of each of these fields can be a simple filename, a
 #   relative path, or an absolute path.  If the value is not an
 #   absolute path, it is interpretted as being relative to the location
 #   of this configuration file.
@@ -80,22 +82,26 @@ const (
 #############################################################################
 
 # URL of the Fabric-ca-server (default: http://localhost:7054)
-URL: <<<URL>>>
+url: <<<URL>>>
 
 # Membership Service Provider (MSP) directory
 # This is useful when the client is used to enroll a peer or orderer, so
 # that the enrollment artifacts are stored in the format expected by MSP.
-MSPDir:
+mspdir:
 
 #############################################################################
-#    TLS section for the client's listening port
+#    TLS section for secure socket connection
+#
+#  certfiles - PEM-encoded list of trusted root certificate files
+#  client:
+#    certfile - PEM-encoded certificate file for when client authentication
+#    is enabled on server
+#    keyfile - PEM-encoded key file for when client authentication
+#    is enabled on server
 #############################################################################
 tls:
-  # Enable TLS (default: false)
-  enabled: false
-
   # TLS section for secure socket connection
-  certfiles:			# Comma Separated list of root certificate files (e.g. root.pem, root2.pem)
+  certfiles:
   client:
     certfile:
     keyfile:
@@ -103,12 +109,34 @@ tls:
 #############################################################################
 #  Certificate Signing Request section for generating the CSR for
 #  an enrollment certificate (ECert)
+#
+#  cn - Used by CAs to determine which domain the certificate is to be generated for
+#  names -  A list of name objects. Each name object should contain at least one
+#  "C", "L", "O", "OU", or "ST" value (or any combination of these). These values are:
+#      "C": country
+#      "L": locality or municipality (such as city or town name)
+#      "O": organisation
+#      "OU": organisational unit, such as the department responsible for owning the key;
+#      it can also be used for a "Doing Business As" (DBS) name
+#      "ST": the state or province
+#  hosts - A list of space-separated host names which the certificate should be valid for
+#
+#  NOTE: The serialnumber field below, if specified, becomes part of the issued
+#  certificate's DN (Distinquished Name).  For example, one use case for this is
+#  a company with its own CA (Certificate Authority) which issues certificates
+#  to its employees and wants to include the employee's serial number in the DN
+#  of its issued certificates.
+#
+#  WARNING: This serialnumber field should not be confused with the certificate's
+#  serial number which is set by the CA but is not a component of the
+#  certificate's DN.
 #############################################################################
 csr:
   cn: <<<ENROLLMENT_ID>>>
+  serialnumber:
   names:
     - C: US
-      ST: "North Carolina"
+      ST: North Carolina
       L:
       O: Hyperledger
       OU: Fabric
@@ -120,23 +148,52 @@ csr:
     expiry:
 
 #############################################################################
-#  Registration section used to register a new user with fabric-ca server
+#  Registration section used to register a new identity with fabric-ca server
+#
+#  name - Unique name of the identity
+#  type - Type of identity being registered (e.g. 'peer, app, user')
+#  maxenrollments - The maximum number of times the secret can be reused to enroll
+#  affiliation - The identity's affiliation
+#  attributes - List of name/value pairs of attribute for identity
 #############################################################################
 id:
   name:
   type:
+  maxenrollments:
   affiliation:
   attributes:
     - name:
       value:
 
 #############################################################################
-#  Enrollment section used to enroll a user with fabric-ca server
+#  Enrollment section used to enroll an identity with fabric-ca server
+#
+#  hosts - A comma-separated list of host names which the certificate should be valid for
+#  profile - Name of the signing profile to use in issuing the certificate
+#  label - Label to use in HSM operations
 #############################################################################
 enrollment:
   hosts:
   profile:
   label:
+
+#############################################################################
+# Name of the CA to connect to within the fabric-ca server
+#############################################################################
+caname:
+
+#############################################################################
+# BCCSP (BlockChain Crypto Service Provider) section allows to select which
+# crypto implementation library to use
+#############################################################################
+bccsp:
+    default: SW
+    sw:
+        hash: SHA2
+        security: 256
+        filekeystore:
+            # The directory used for the software file-based keystore
+            keystore: msp/keystore
 `
 )
 
@@ -144,12 +201,15 @@ var (
 	// cfgFileName is the name of the client's config file
 	cfgFileName string
 
+	// cfgAttrs are the attributes specified via flags or env variables
+	// and translated to Attributes field in registration
+	cfgAttrs []string
+
 	// clientCfg is the client's config
 	clientCfg *lib.ClientConfig
 )
 
 func configInit(command string) error {
-
 	var err error
 
 	if cfgFileName != "" {
@@ -191,9 +251,23 @@ func configInit(command string) error {
 	}
 
 	// Unmarshal the config into 'clientCfg'
-	err = viper.Unmarshal(clientCfg)
-	if err != nil {
-		util.Fatal("Could not parse '%s': %s", cfgFileName, err)
+	// When viper bug https://github.com/spf13/viper/issues/327 is fixed
+	// and vendored, the work around code can be deleted.
+	viperIssue327WorkAround := true
+	if viperIssue327WorkAround {
+		sliceFields := []string{
+			"csr.hosts",
+			"tls.certfiles",
+		}
+		err = util.ViperUnmarshal(clientCfg, sliceFields, viper.GetViper())
+		if err != nil {
+			return fmt.Errorf("Incorrect format in file '%s': %s", cfgFileName, err)
+		}
+	} else {
+		err = viper.Unmarshal(clientCfg)
+		if err != nil {
+			return fmt.Errorf("Incorrect format in file '%s': %s", cfgFileName, err)
+		}
 	}
 
 	purl, err := url.Parse(clientCfg.URL)
@@ -203,11 +277,11 @@ func configInit(command string) error {
 
 	clientCfg.TLS.Enabled = purl.Scheme == "https"
 
-	clientCfg.TLS.CertFilesList = util.ProcessCertFiles(clientCfg.TLS.CertFiles)
-
-	if clientCfg.ID.Attr != "" {
-		processAttributes()
+	err = processAttributes()
+	if err != nil {
+		return err
 	}
+
 	return nil
 }
 
@@ -236,8 +310,9 @@ func createDefaultConfigFile() error {
 	}
 	cfg = strings.Replace(cfg, "<<<ENROLLMENT_ID>>>", user, 1)
 
-	// Now write the file
-	err = os.MkdirAll(filepath.Dir(cfgFileName), 0755)
+	// Create the directory if necessary
+	cfgDir := filepath.Dir(cfgFileName)
+	err = os.MkdirAll(cfgDir, 0755)
 	if err != nil {
 		return err
 	}
@@ -245,11 +320,20 @@ func createDefaultConfigFile() error {
 	return ioutil.WriteFile(cfgFileName, []byte(cfg), 0755)
 }
 
-// processAttributes parses attributes from command line
-func processAttributes() {
-	splitAttr := strings.Split(clientCfg.ID.Attr, "=")
-	clientCfg.ID.Attributes[0].Name = splitAttr[0]
-	clientCfg.ID.Attributes[0].Value = strings.Join(splitAttr[1:], "")
+// processAttributes parses attributes from command line or env variable
+func processAttributes() error {
+	if cfgAttrs != nil {
+		clientCfg.ID.Attributes = make([]api.Attribute, len(cfgAttrs))
+		for idx, attr := range cfgAttrs {
+			sattr := strings.SplitN(attr, "=", 2)
+			if len(sattr) != 2 {
+				return fmt.Errorf("Attribute '%s' is missing '=' ; it must be of the form <name>=<value>", attr)
+			}
+			clientCfg.ID.Attributes[idx].Name = sattr[0]
+			clientCfg.ID.Attributes[idx].Value = sattr[1]
+		}
+	}
+	return nil
 }
 
 func checkForEnrollment() error {

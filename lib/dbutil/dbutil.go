@@ -35,30 +35,43 @@ func NewUserRegistrySQLLite3(datasource string) (*sqlx.DB, bool, error) {
 	log.Debugf("Using sqlite database, connect to database in home (%s) directory", datasource)
 
 	datasource = filepath.Join(datasource)
-	var exists bool
+	exists := false
 
 	if datasource != "" {
-		// Check if database exists if not create it and bootstrap it based on the config file
-		if _, err := os.Stat(datasource); err != nil {
-			if os.IsNotExist(err) {
-				log.Debugf("Database (%s) does not exist", datasource)
-				exists = false
-				err2 := createSQLiteDBTables(datasource)
-				if err2 != nil {
-					return nil, false, err2
-				}
-			} else {
-				log.Debug("Database (%s) exists", datasource)
-				exists = true
+		// Check if database exists if not create it and bootstrap it based
+		// on the config file
+		_, err := os.Stat(datasource)
+		if err != nil && os.IsNotExist(err) {
+			log.Debugf("Database (%s) does not exist", datasource)
+			err2 := createSQLiteDBTables(datasource)
+			if err2 != nil {
+				return nil, false, err2
 			}
+		} else {
+			// database file exists. If os.Stat returned an error
+			// other than IsNotExist error, which still means
+			// file exists
+			log.Debugf("Database (%s) exists", datasource)
+			exists = true
 		}
 	}
 
-	db, err := sqlx.Open("sqlite3", datasource)
+	db, err := sqlx.Open("sqlite3", datasource+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, false, err
 	}
 
+	// Set maximum open connections to one. This is to share one connection
+	// across multiple go routines. This will serialize database operations
+	// with in a single server there by preventing "database is locked"
+	// error under load. The "Database is locked" error is still expected
+	// when multiple servers are accessing the same database (but mitigated
+	// by specifying _busy_timeout to 5 seconds). Since sqlite is
+	// for development and test purposes only, and is not recommended to
+	// be used in a clustered topology, setting max open connections to
+	// 1 is a quick and effective solution
+	// For more info refer to https://github.com/mattn/go-sqlite3/issues/274
+	db.SetMaxOpenConns(1)
 	log.Debug("Successfully opened sqlite3 DB")
 
 	return db, exists, nil
@@ -71,6 +84,7 @@ func createSQLiteDBTables(datasource string) error {
 	if err != nil {
 		return fmt.Errorf("Failed to open database: %s", err)
 	}
+	defer db.Close()
 
 	log.Debug("Creating tables...")
 	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS users (id VARCHAR(64), token bytea, type VARCHAR(64), affiliation VARCHAR(64), attributes VARCHAR(256), state INTEGER,  max_enrollments INTEGER)"); err != nil {
@@ -78,7 +92,7 @@ func createSQLiteDBTables(datasource string) error {
 	}
 	log.Debug("Created users table")
 
-	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS affiliations (name VARCHAR(64), prekey VARCHAR(64))"); err != nil {
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS affiliations (name VARCHAR(64) NOT NULL UNIQUE, prekey VARCHAR(64))"); err != nil {
 		return err
 	}
 	log.Debug("Created affiliation table")
@@ -106,8 +120,8 @@ func NewUserRegistryPostgres(datasource string, clientTLSConfig *tls.ClientTLSCo
 	connStr := getConnStr(datasource)
 
 	if clientTLSConfig.Enabled {
-		if len(clientTLSConfig.CertFilesList) > 0 {
-			root := clientTLSConfig.CertFilesList[0]
+		if len(clientTLSConfig.CertFiles) > 0 {
+			root := clientTLSConfig.CertFiles[0]
 			connStr = fmt.Sprintf("%s sslrootcert=%s", connStr, root)
 		}
 
@@ -176,7 +190,7 @@ func createPostgresDBTables(datasource string, dbName string, db *sqlx.DB) error
 		log.Errorf("Error creating users table [error: %s] ", err)
 		return err
 	}
-	if _, err := database.Exec("CREATE TABLE affiliations (name VARCHAR(64), prekey VARCHAR(64))"); err != nil {
+	if _, err := database.Exec("CREATE TABLE affiliations (name VARCHAR(64) NOT NULL UNIQUE, prekey VARCHAR(64))"); err != nil {
 		log.Errorf("Error creating affiliations table [error: %s] ", err)
 		return err
 	}
@@ -262,7 +276,7 @@ func createMySQLTables(datasource string, dbName string, db *sqlx.DB) error {
 		log.Errorf("Error creating users table [error: %s] ", err)
 		return err
 	}
-	if _, err := database.Exec("CREATE TABLE affiliations (name VARCHAR(64), prekey VARCHAR(64))"); err != nil {
+	if _, err := database.Exec("CREATE TABLE affiliations (name VARCHAR(64) NOT NULL UNIQUE, prekey VARCHAR(64))"); err != nil {
 		log.Errorf("Error creating affiliations table [error: %s] ", err)
 		return err
 	}

@@ -24,7 +24,6 @@ import (
 	"github.com/hyperledger/fabric-ca/lib"
 	"github.com/hyperledger/fabric-ca/util"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
@@ -39,7 +38,6 @@ var (
 				return err
 			}
 			cmd.SilenceUsage = true
-			cmd.SilenceErrors = true
 			util.CmdRunBegin()
 			return nil
 		},
@@ -58,7 +56,6 @@ func init() {
 	// Set specific global flags used by all commands
 	pflags := rootCmd.PersistentFlags()
 	pflags.StringVarP(&cfgFileName, "config", "c", cfg, "Configuration file")
-	util.FlagString(pflags, "url", "u", "", "URL of the parent fabric-ca-server")
 	util.FlagString(pflags, "boot", "b", "",
 		"The user:pass for bootstrap admin which is required to build default config file")
 
@@ -66,9 +63,15 @@ func init() {
 	serverCfg = &lib.ServerConfig{}
 	tags := map[string]string{
 		"help.csr.cn":           "The common name field of the certificate signing request to a parent fabric-ca-server",
-		"help.csr.serialnumber": "The serial number in a certificate signing request to a parent fabric-ca-server",
+		"skip.csr.serialnumber": "true",
+		"help.csr.hosts":        "A list of space-separated host names in a certificate signing request to a parent fabric-ca-server",
 	}
-	err := util.RegisterFlags(pflags, serverCfg, tags)
+	err := util.RegisterFlags(pflags, serverCfg, nil)
+	if err != nil {
+		panic(err)
+	}
+	caCfg := &lib.CAConfig{}
+	err = util.RegisterFlags(pflags, caCfg, tags)
 	if err != nil {
 		panic(err)
 	}
@@ -97,23 +100,14 @@ func RunMain(args []string) error {
 	return err
 }
 
-func registerCommonFlags(flags *pflag.FlagSet) {
-	util.FlagString(flags, "ca.keyfile", "", "key.pem",
-		"PEM-encoded key file for certificate issuance")
-	util.FlagString(flags, "ca.certfile", "", "cert.pem",
-		"PEM-encoded certificate file used for certificate issuance")
-	util.FlagString(flags, "tls.keyfile", "", "key.pem",
-		"PEM-encoded key file used for TLS")
-	util.FlagString(flags, "tls.certfile", "", "cert.pem",
-		"PEM-encoded certificate file used for TLS")
-}
-
 // Get a server for the init and start commands
 func getServer() *lib.Server {
 	return &lib.Server{
-		HomeDir:         filepath.Dir(cfgFileName),
-		Config:          serverCfg,
-		BlockingStart:   blockingStart,
-		ParentServerURL: viper.GetString("url"),
+		HomeDir:       filepath.Dir(cfgFileName),
+		Config:        serverCfg,
+		BlockingStart: blockingStart,
+		CA: lib.CA{
+			Config: &serverCfg.CAcfg,
+		},
 	}
 }

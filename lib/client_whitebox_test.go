@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	rootPort    = 7055
+	whitePort   = 7058
 	rootDir     = "rootDir"
 	testdataDir = "../testdata"
 	user        = "admin"
@@ -38,7 +38,7 @@ const (
 var clientConfig = path.Join(testdataDir, "client-config.json")
 
 func TestClient1(t *testing.T) {
-	server := getServer(rootPort, path.Join(serversDir, "c1"), "", 1, t)
+	server := getServer(whitePort, path.Join(serversDir, "c1"), "", 1, t)
 	if server == nil {
 		t.Fatal("Failed to get server")
 	}
@@ -50,10 +50,12 @@ func TestClient1(t *testing.T) {
 	testInvalidAuthEnrollment(t)
 
 	server.Stop()
+
+	os.RemoveAll(serversDir)
 }
 
 func testInvalidAuthEnrollment(t *testing.T) {
-	c := getTestClient(rootPort)
+	c := getTestClient(whitePort)
 	err := c.Init()
 	if err != nil {
 		t.Fatalf("Failed to initialize client: %s", err)
@@ -111,7 +113,6 @@ func getEnrollmentPayload(t *testing.T, c *Client) ([]byte, error) {
 
 	// Get the body of the request
 	sreq := signer.SignRequest{
-		Hosts:   signer.SplitHosts(req.Hosts),
 		Request: string(csrPEM),
 		Profile: req.Profile,
 		Label:   req.Label,
@@ -132,17 +133,29 @@ func getServer(port int, home, parentURL string, maxEnroll int, t *testing.T) *S
 		},
 		"org2": nil,
 	}
+	affiliations[affiliationName] = map[string]interface{}{
+		"department1": nil,
+		"department2": nil,
+	}
 	srv := &Server{
 		Config: &ServerConfig{
-			Port:         port,
-			Debug:        true,
-			Affiliations: affiliations,
-			Registry: ServerConfigRegistry{
-				MaxEnrollments: maxEnroll,
+			Port:  port,
+			Debug: true,
+		},
+		CA: CA{
+			Config: &CAConfig{
+				Intermediate: IntermediateCA{
+					ParentServer: ParentServer{
+						URL: parentURL,
+					},
+				},
+				Affiliations: affiliations,
+				Registry: CAConfigRegistry{
+					MaxEnrollments: maxEnroll,
+				},
 			},
 		},
-		HomeDir:         home,
-		ParentServerURL: parentURL,
+		HomeDir: home,
 	}
 	// The bootstrap user's affiliation is the empty string, which
 	// means the user is at the affiliation root

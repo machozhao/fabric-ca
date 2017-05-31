@@ -28,9 +28,15 @@ import (
 // initCmd represents the init command
 var registerCmd = &cobra.Command{
 	Use:   "register",
-	Short: "Register user",
-	Long:  "Register user with fabric-ca server",
+	Short: "Register an identity",
+	Long:  "Register an identity with fabric-ca server",
+	// PreRunE block for this command will check to make sure enrollment
+	// information exists before running the command
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf(extraArgsError, args, cmd.UsageString())
+		}
+
 		err := configInit(cmd.Name())
 		if err != nil {
 			return err
@@ -41,11 +47,6 @@ var registerCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) > 0 {
-			cmd.Help()
-			return nil
-		}
-
 		err := runRegister()
 		if err != nil {
 			return err
@@ -73,6 +74,7 @@ func runRegister() error {
 		return err
 	}
 
+	clientCfg.ID.CAName = clientCfg.CAName
 	resp, err := id.Register(&clientCfg.ID)
 	if err != nil {
 		return err
